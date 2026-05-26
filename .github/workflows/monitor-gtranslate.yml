@@ -15,6 +15,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
       - name: Check translated URLs
         id: check
         shell: bash
@@ -26,25 +27,15 @@ jobs:
             "https://visuresolutions.com/it/"
           )
 
-          REQUIRED_TEXT="Visure Solutions"
           FAILED=""
 
           for URL in "${URLS[@]}"; do
             echo "Checking $URL"
 
             BODY=$(curl -L -s --max-time 15 --connect-timeout 8 "$URL" || true)
-            STATUS=$(curl -L -s -o /dev/null -w "%{http_code}" --max-time 15 --connect-timeout 8 "$URL" || echo "000")
 
-            if [ "$STATUS" != "200" ]; then
-              FAILED="${FAILED}\n- ${URL}: HTTP ${STATUS}"
-            elif echo "$BODY" | grep -qi "SSL handshake failed"; then
+            if echo "$BODY" | grep -qi "SSL handshake failed"; then
               FAILED="${FAILED}\n- ${URL}: SSL handshake failed"
-            elif echo "$BODY" | grep -qi "GTranslate - Translation Proxy"; then
-              FAILED="${FAILED}\n- ${URL}: GTranslate proxy error"
-            elif echo "$BODY" | grep -qi "An error occurred"; then
-              FAILED="${FAILED}\n- ${URL}: generic error page detected"
-            elif ! echo "$BODY" | grep -qi "$REQUIRED_TEXT"; then
-              FAILED="${FAILED}\n- ${URL}: required text not found"
             fi
           done
 
@@ -69,7 +60,7 @@ jobs:
             --jq 'length')
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
 
-      - name: Create issue and send email when incident starts
+      - name: Send alert email when incident starts
         if: steps.check.outputs.failed == 'true' && steps.issue_search.outputs.count == '0'
         uses: dawidd6/action-send-mail@v3
         with:
@@ -77,13 +68,13 @@ jobs:
           server_port: ${{ secrets.SMTP_PORT }}
           username: ${{ secrets.SMTP_USER }}
           password: ${{ secrets.SMTP_PASS }}
-          subject: "ALERTA: GTranslate fallando en Visure Solutions"
+          subject: "ALERTA: GTranslate SSL handshake failed"
           to: ${{ secrets.ALERT_EMAIL_TO }}
           from: ${{ secrets.ALERT_EMAIL_FROM }}
           body: |
-            Se detectó un problema en las páginas traducidas de Visure Solutions.
+            Se detectó el error "SSL handshake failed" en páginas traducidas de Visure Solutions.
 
-            Detalles:
+            URLs afectadas:
             ${{ steps.check.outputs.details }}
 
             El monitor corre cada 5 minutos.
@@ -95,28 +86,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh issue create \
-            --title "GTranslate translation failure detected" \
+            --title "GTranslate SSL handshake failed detected" \
             --label "gtranslate-monitor" \
-            --body "Automatic monitor detected translation failures:
+            --body "Automatic monitor detected SSL handshake failed in translated pages:
 
           ${{ steps.check.outputs.details }}
 
-          Possible causes:
-          - GTranslate proxy issue
-          - SSL handshake problem
-          - CDN/WAF blocking
-          - Hostinger temporary availability issue
+          This issue will remain open until the error disappears."
 
-          This issue will remain open until the translated URLs recover."
-
-      - name: Close issue and send recovery email
+      - name: Close issue when recovered
         if: steps.check.outputs.failed == 'false' && steps.issue_search.outputs.count != '0'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           ISSUES=$(gh issue list --state open --label "gtranslate-monitor" --json number --jq '.[].number')
           for ISSUE in $ISSUES; do
-            gh issue comment "$ISSUE" --body "Recovery detected. All monitored translated URLs are working again."
+            gh issue comment "$ISSUE" --body "Recovery detected. The SSL handshake failed error is no longer present."
             gh issue close "$ISSUE"
           done
 
@@ -128,10 +113,10 @@ jobs:
           server_port: ${{ secrets.SMTP_PORT }}
           username: ${{ secrets.SMTP_USER }}
           password: ${{ secrets.SMTP_PASS }}
-          subject: "RECUPERADO: GTranslate funcionando otra vez"
+          subject: "RECUPERADO: GTranslate SSL handshake failed solucionado"
           to: ${{ secrets.ALERT_EMAIL_TO }}
           from: ${{ secrets.ALERT_EMAIL_FROM }}
           body: |
             El monitor detectó recuperación.
 
-            Todas las URLs traducidas monitoreadas están funcionando nuevamente.
+            El error "SSL handshake failed" ya no aparece en las páginas traducidas monitoreadas.

@@ -2,8 +2,8 @@ name: Monitor GTranslate Translations
 
 on:
   push:
-  schedule:
-    - cron: "*/5 * * * *"
+  repository_dispatch:
+    types: [gtranslate-monitor]
   workflow_dispatch:
 
 permissions:

@@ -126,24 +126,15 @@ jobs:
 
           open(after_path, "w", encoding="utf-8").write(new_content)
 
-          summary = f"""GTranslate auto-remediation executed.
-
-Domain:
-{domain}
-
-Detected active server index:
-{server_id}
-
-Detected problematic node:
-{bad_node}
-
-Original server array:
-{servers}
-
-Updated server array:
-{new_servers}
-"""
-
+          summary = (
+              "GTranslate auto-remediation executed.\n\n"
+              f"Domain:\n{domain}\n\n"
+              f"Detected active server index:\n{server_id}\n\n"
+              f"Detected problematic node:\n{bad_node}\n\n"
+              f"Original server array:\n{servers}\n\n"
+              f"Updated server array:\n{new_servers}\n"
+          )
+          
           open(summary_path, "w", encoding="utf-8").write(summary)
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:

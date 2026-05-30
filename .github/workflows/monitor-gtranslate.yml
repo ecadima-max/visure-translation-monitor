@@ -63,7 +63,7 @@ jobs:
             --jq 'length')
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
 
-      - name: Auto-remediate GTranslate config
+      - name: Auto-remediate GTranslate config with up to 3 attempts
         id: remediate
         if: steps.check.outputs.failed == 'true' && steps.issue_search.outputs.count == '0' && env.AUTO_FIX_ENABLED == 'true'
         shell: bash
@@ -92,8 +92,6 @@ jobs:
           import os, re, hashlib
 
           before_path = "gtranslate-remediation/config.before.php"
-          after_path = "gtranslate-remediation/config.after.php"
-
           domain = os.environ["DOMAIN"].lower().strip()
           domain = re.sub(r"^www\.", "", domain)
 
@@ -113,34 +111,65 @@ jobs:
               raise SystemExit("Could not parse server list")
 
           hash_prefix = hashlib.md5(domain.encode()).hexdigest()[:5]
-          server_id = int(hash_prefix, 16) % len(servers)
-          bad_node = servers[server_id]
+          calculated_index = int(hash_prefix, 16) % len(servers)
 
-          new_servers = servers[:server_id] + servers[server_id+1:]
+          attempts = []
+          removed_indices = []
 
-          if len(new_servers) < 2:
-              raise SystemExit("Refusing to remove node because server list would become too small")
+          max_attempts = min(3, len(servers) - 2)
 
-          new_array = "$servers = array(" + ", ".join([repr(s) for s in new_servers]) + ");"
-          new_content = content[:match.start()] + new_array + content[match.end():]
+          for attempt in range(1, max_attempts + 1):
+              idx = (calculated_index + attempt - 1) % len(servers)
 
-          open(after_path, "w", encoding="utf-8").write(new_content)
+              if idx in removed_indices:
+                  continue
+
+              removed_indices.append(idx)
+
+              new_servers = [
+                  server for i, server in enumerate(servers)
+                  if i not in removed_indices
+              ]
+
+              if len(new_servers) < 2:
+                  raise SystemExit("Refusing to remove nodes because server list would become too small")
+
+              new_array = "$servers = array(" + ", ".join([repr(s) for s in new_servers]) + ");"
+              new_content = content[:match.start()] + new_array + content[match.end():]
+
+              attempt_path = f"gtranslate-remediation/config.attempt{attempt}.php"
+              open(attempt_path, "w", encoding="utf-8").write(new_content)
+
+              attempts.append({
+                  "attempt": attempt,
+                  "removed_node": servers[idx],
+                  "removed_index": idx,
+                  "updated_servers": new_servers,
+                  "attempt_path": attempt_path
+              })
+
+          with open("gtranslate-remediation/attempts.tsv", "w", encoding="utf-8") as f:
+              for item in attempts:
+                  f.write(
+                      f"{item['attempt']}\t"
+                      f"{item['removed_node']}\t"
+                      f"{item['removed_index']}\t"
+                      f"{item['attempt_path']}\t"
+                      f"{item['updated_servers']}\n"
+                  )
 
           summary = (
-              "GTranslate auto-remediation executed.\n\n"
+              "GTranslate auto-remediation prepared.\n\n"
               f"Domain:\n{domain}\n\n"
-              f"Detected active server index:\n{server_id}\n\n"
-              f"Detected problematic node:\n{bad_node}\n\n"
+              f"Calculated starting server index:\n{calculated_index}\n\n"
               f"Original server array:\n{servers}\n\n"
-              f"Updated server array:\n{new_servers}\n"
+              "Remediation strategy:\n"
+              "Attempt #1 removes the calculated node.\n"
+              "Attempt #2 additionally removes the next node if still failing.\n"
+              "Attempt #3 additionally removes the next node if still failing.\n"
           )
 
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-              out.write(f"node={bad_node}\n")
-              out.write(f"server_id={server_id}\n")
-              out.write("summary<<EOF\n")
-              out.write(summary)
-              out.write("\nEOF\n")
+          open("gtranslate-remediation/summary.txt", "w", encoding="utf-8").write(summary)
           PY
 
           TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
@@ -148,20 +177,8 @@ jobs:
           lftp -u "$SFTP_USER","$SFTP_PASS" sftp://"$SFTP_HOST":"$SFTP_PORT" -e "
             set sftp:auto-confirm yes;
             put gtranslate-remediation/config.before.php -o ${CONFIG_PATH}.backup-${TIMESTAMP};
-            put gtranslate-remediation/config.after.php -o $CONFIG_PATH;
             bye
           "
-
-          echo "before_config<<EOF" >> "$GITHUB_OUTPUT"
-          cat gtranslate-remediation/config.before.php >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
-      - name: Re-check translated URLs after remediation
-        id: recheck
-        if: steps.remediate.outputs.node != ''
-        shell: bash
-        run: |
-          sleep 20
 
           URLS=(
             "https://visuresolutions.com/de/"
@@ -170,25 +187,96 @@ jobs:
             "https://visuresolutions.com/it/"
           )
 
-          FAILED=""
+          RECOVERED="false"
+          FINAL_DETAILS=""
+          REMOVED_NODES=""
+          FINAL_SUMMARY="$(cat gtranslate-remediation/summary.txt)"
 
-          for URL in "${URLS[@]}"; do
-            echo "Re-checking $URL"
-            BODY=$(curl -L -s --max-time 15 --connect-timeout 8 "$URL" || true)
+          while IFS=$'\t' read -r ATTEMPT NODE INDEX ATTEMPT_PATH UPDATED_ARRAY; do
+            echo "Attempt $ATTEMPT: removing node $NODE at index $INDEX"
 
-            if echo "$BODY" | grep -qi "SSL handshake failed"; then
-              FAILED="${FAILED}\n- ${URL}: SSL handshake failed"
+            lftp -u "$SFTP_USER","$SFTP_PASS" sftp://"$SFTP_HOST":"$SFTP_PORT" -e "
+              set sftp:auto-confirm yes;
+              put $ATTEMPT_PATH -o $CONFIG_PATH;
+              bye
+            "
+
+            sleep 20
+
+            FAILED=""
+
+            for URL in "${URLS[@]}"; do
+              echo "Re-checking $URL after attempt $ATTEMPT"
+              BODY=$(curl -L -s --max-time 15 --connect-timeout 8 "$URL" || true)
+
+              if echo "$BODY" | grep -qi "SSL handshake failed"; then
+                FAILED="${FAILED}\n- ${URL}: SSL handshake failed"
+              fi
+            done
+
+            if [ -z "$REMOVED_NODES" ]; then
+              REMOVED_NODES="$NODE"
+            else
+              REMOVED_NODES="$REMOVED_NODES, $NODE"
             fi
-          done
 
-          if [ -n "$FAILED" ]; then
-            echo "recovered=false" >> "$GITHUB_OUTPUT"
-            echo "details<<EOF" >> "$GITHUB_OUTPUT"
-            echo -e "$FAILED" >> "$GITHUB_OUTPUT"
-            echo "EOF" >> "$GITHUB_OUTPUT"
-          else
-            echo "recovered=true" >> "$GITHUB_OUTPUT"
+            FINAL_SUMMARY="${FINAL_SUMMARY}
+
+Attempt #${ATTEMPT}
+Removed node: ${NODE}
+Removed index: ${INDEX}
+Updated server array: ${UPDATED_ARRAY}
+"
+
+            if [ -z "$FAILED" ]; then
+              RECOVERED="true"
+              FINAL_DETAILS="Recovered after attempt #${ATTEMPT}. Removed nodes: ${REMOVED_NODES}"
+              FINAL_SUMMARY="${FINAL_SUMMARY}
+
+Result:
+Recovered after attempt #${ATTEMPT}.
+"
+              break
+            else
+              FINAL_DETAILS="$FAILED"
+              FINAL_SUMMARY="${FINAL_SUMMARY}
+
+Result:
+Still failing after attempt #${ATTEMPT}.
+"
+            fi
+          done < gtranslate-remediation/attempts.tsv
+
+          if [ "$RECOVERED" != "true" ]; then
+            echo "All remediation attempts failed. Restoring original config.php."
+
+            lftp -u "$SFTP_USER","$SFTP_PASS" sftp://"$SFTP_HOST":"$SFTP_PORT" -e "
+              set sftp:auto-confirm yes;
+              put gtranslate-remediation/config.before.php -o $CONFIG_PATH;
+              bye
+            "
+
+            FINAL_SUMMARY="${FINAL_SUMMARY}
+
+Final result:
+All 3 attempts failed. Original config.php was restored.
+"
           fi
+
+          echo "recovered=$RECOVERED" >> "$GITHUB_OUTPUT"
+          echo "removed_nodes=$REMOVED_NODES" >> "$GITHUB_OUTPUT"
+
+          echo "details<<EOF" >> "$GITHUB_OUTPUT"
+          echo -e "$FINAL_DETAILS" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          echo "summary<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$FINAL_SUMMARY" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          echo "before_config<<EOF" >> "$GITHUB_OUTPUT"
+          cat gtranslate-remediation/config.before.php >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
 
       - name: Send alert and remediation email
         if: steps.check.outputs.failed == 'true' && steps.issue_search.outputs.count == '0'
@@ -210,14 +298,20 @@ jobs:
             Auto-remediación:
             ${{ steps.remediate.outputs.summary }}
 
-            Resultado del re-check:
-            recovered=${{ steps.recheck.outputs.recovered }}
+            Resultado:
+            recovered=${{ steps.remediate.outputs.recovered }}
+
+            Nodos removidos:
+            ${{ steps.remediate.outputs.removed_nodes }}
+
+            Detalles:
+            ${{ steps.remediate.outputs.details }}
 
             Config.php ANTES de la modificación:
             ${{ steps.remediate.outputs.before_config }}
 
       - name: Create GitHub issue when incident starts and still failing
-        if: steps.check.outputs.failed == 'true' && steps.issue_search.outputs.count == '0' && steps.recheck.outputs.recovered != 'true'
+        if: steps.check.outputs.failed == 'true' && steps.issue_search.outputs.count == '0' && steps.remediate.outputs.recovered != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -234,12 +328,12 @@ jobs:
 
           Re-check result:
 
-          ${{ steps.recheck.outputs.details }}
+          ${{ steps.remediate.outputs.details }}
 
           This issue will remain open until the error disappears."
 
       - name: Send recovery email after successful auto-remediation
-        if: steps.check.outputs.failed == 'true' && steps.recheck.outputs.recovered == 'true'
+        if: steps.check.outputs.failed == 'true' && steps.remediate.outputs.recovered == 'true'
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: ${{ secrets.SMTP_HOST }}
@@ -252,8 +346,8 @@ jobs:
           body: |
             El monitor detectó recuperación después de auto-remediación.
 
-            Nodo removido:
-            ${{ steps.remediate.outputs.node }}
+            Nodos removidos:
+            ${{ steps.remediate.outputs.removed_nodes }}
 
             Detalles:
             ${{ steps.remediate.outputs.summary }}

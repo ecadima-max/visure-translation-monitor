@@ -32,7 +32,6 @@ jobs:
 
           for URL in "${URLS[@]}"; do
             echo "Checking $URL"
-
             BODY=$(curl -L -s --max-time 15 --connect-timeout 8 "$URL" || true)
 
             if echo "$BODY" | grep -qi "SSL handshake failed"; then
@@ -61,7 +60,149 @@ jobs:
             --jq 'length')
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
 
-      - name: Send alert email when incident starts
+      - name: Auto-remediate GTranslate config
+        id: remediate
+        if: steps.check.outputs.failed == 'true' && steps.issue_search.outputs.count == '0' && secrets.AUTO_FIX_ENABLED == 'true'
+        shell: bash
+        env:
+          SFTP_HOST: ${{ secrets.SFTP_HOST }}
+          SFTP_PORT: ${{ secrets.SFTP_PORT }}
+          SFTP_USER: ${{ secrets.SFTP_USER }}
+          SFTP_PASS: ${{ secrets.SFTP_PASS }}
+          CONFIG_PATH: ${{ secrets.GTRANSLATE_CONFIG_PATH }}
+          DOMAIN: ${{ secrets.GTRANSLATE_DOMAIN }}
+        run: |
+          set -e
+
+          sudo apt-get update
+          sudo apt-get install -y lftp
+
+          mkdir -p gtranslate-remediation
+
+          echo "Downloading current config.php..."
+          lftp -u "$SFTP_USER","$SFTP_PASS" sftp://"$SFTP_HOST":"$SFTP_PORT" -e "
+            set sftp:auto-confirm yes;
+            get $CONFIG_PATH -o gtranslate-remediation/config.before.php;
+            bye
+          "
+
+          python3 << 'PY'
+          import os, re, hashlib
+
+          before_path = "gtranslate-remediation/config.before.php"
+          after_path = "gtranslate-remediation/config.after.php"
+          summary_path = "gtranslate-remediation/summary.txt"
+
+          domain = os.environ["DOMAIN"].lower().strip()
+          domain = re.sub(r"^www\.", "", domain)
+
+          content = open(before_path, "r", encoding="utf-8", errors="ignore").read()
+
+          pattern = re.compile(r"(?m)^(\s*\$servers\s*=\s*array\s*\()(.*?)(\)\s*;)", re.DOTALL)
+          match = pattern.search(content)
+
+          if not match:
+              raise SystemExit("Could not find active $servers array in config.php")
+
+          array_body = match.group(2)
+          servers = re.findall(r"'([^']+)'|\"([^\"]+)\"", array_body)
+          servers = [a or b for a, b in servers]
+
+          if not servers:
+              raise SystemExit("Could not parse server list")
+
+          hash_prefix = hashlib.md5(domain.encode()).hexdigest()[:5]
+          server_id = int(hash_prefix, 16) % len(servers)
+          bad_node = servers[server_id]
+
+          new_servers = servers[:server_id] + servers[server_id+1:]
+
+          if len(new_servers) < 2:
+              raise SystemExit("Refusing to remove node because server list would become too small")
+
+          new_array = "$servers = array(" + ", ".join([repr(s) for s in new_servers]) + ");"
+
+          new_content = content[:match.start()] + new_array + content[match.end():]
+
+          open(after_path, "w", encoding="utf-8").write(new_content)
+
+          summary = f"""GTranslate auto-remediation executed.
+
+Domain:
+{domain}
+
+Detected active server index:
+{server_id}
+
+Detected problematic node:
+{bad_node}
+
+Original server array:
+{servers}
+
+Updated server array:
+{new_servers}
+"""
+
+          open(summary_path, "w", encoding="utf-8").write(summary)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"node={bad_node}\n")
+              out.write(f"server_id={server_id}\n")
+              out.write("summary<<EOF\n")
+              out.write(summary)
+              out.write("\nEOF\n")
+          PY
+
+          TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
+
+          echo "Uploading backup and modified config.php..."
+          lftp -u "$SFTP_USER","$SFTP_PASS" sftp://"$SFTP_HOST":"$SFTP_PORT" -e "
+            set sftp:auto-confirm yes;
+            put gtranslate-remediation/config.before.php -o ${CONFIG_PATH}.backup-${TIMESTAMP};
+            put gtranslate-remediation/config.after.php -o $CONFIG_PATH;
+            bye
+          "
+
+          echo "before_config<<EOF" >> "$GITHUB_OUTPUT"
+          cat gtranslate-remediation/config.before.php >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Re-check translated URLs after remediation
+        id: recheck
+        if: steps.remediate.outputs.node != ''
+        shell: bash
+        run: |
+          sleep 20
+
+          URLS=(
+            "https://visuresolutions.com/de/"
+            "https://visuresolutions.com/fr/"
+            "https://visuresolutions.com/es/"
+            "https://visuresolutions.com/it/"
+          )
+
+          FAILED=""
+
+          for URL in "${URLS[@]}"; do
+            echo "Re-checking $URL"
+            BODY=$(curl -L -s --max-time 15 --connect-timeout 8 "$URL" || true)
+
+            if echo "$BODY" | grep -qi "SSL handshake failed"; then
+              FAILED="${FAILED}\n- ${URL}: SSL handshake failed"
+            fi
+          done
+
+          if [ -n "$FAILED" ]; then
+            echo "recovered=false" >> "$GITHUB_OUTPUT"
+            echo "details<<EOF" >> "$GITHUB_OUTPUT"
+            echo -e "$FAILED" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+          else
+            echo "recovered=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Send alert and remediation email
         if: steps.check.outputs.failed == 'true' && steps.issue_search.outputs.count == '0'
         uses: dawidd6/action-send-mail@v3
         with:
@@ -78,11 +219,21 @@ jobs:
             URLs afectadas:
             ${{ steps.check.outputs.details }}
 
-            El monitor corre cada 5 minutos.
-            No se enviarán emails repetidos mientras el incidente siga abierto.
+            Auto-remediación:
+            ${{ steps.remediate.outputs.summary }}
 
-      - name: Create GitHub issue when incident starts
-        if: steps.check.outputs.failed == 'true' && steps.issue_search.outputs.count == '0'
+            Resultado del re-check después de modificar config.php:
+            recovered=${{ steps.recheck.outputs.recovered }}
+
+            Si recovered=true, el nodo conflictivo fue removido correctamente.
+            Si recovered=false, todavía quedan URLs afectadas:
+            ${{ steps.recheck.outputs.details }}
+
+            Config.php ANTES de la modificación:
+            ${{ steps.remediate.outputs.before_config }}
+
+      - name: Create GitHub issue when incident starts and still failing
+        if: steps.check.outputs.failed == 'true' && steps.issue_search.outputs.count == '0' && steps.recheck.outputs.recovered != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -93,9 +244,38 @@ jobs:
 
           ${{ steps.check.outputs.details }}
 
+          Auto-remediation was attempted.
+
+          ${{ steps.remediate.outputs.summary }}
+
+          Re-check result:
+          ${{ steps.recheck.outputs.details }}
+
           This issue will remain open until the error disappears."
 
-      - name: Close issue when recovered
+      - name: Send recovery email after successful auto-remediation
+        if: steps.check.outputs.failed == 'true' && steps.recheck.outputs.recovered == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_HOST }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USER }}
+          password: ${{ secrets.SMTP_PASS }}
+          subject: "RECUPERADO: GTranslate SSL handshake failed solucionado"
+          to: ${{ secrets.ALERT_EMAIL_TO }}
+          from: ${{ secrets.ALERT_EMAIL_FROM }}
+          body: |
+            El monitor detectó recuperación después de auto-remediación.
+
+            Nodo removido:
+            ${{ steps.remediate.outputs.node }}
+
+            Detalles:
+            ${{ steps.remediate.outputs.summary }}
+
+            El error "SSL handshake failed" ya no aparece en las páginas traducidas monitoreadas.
+
+      - name: Close issue when recovered naturally
         if: steps.check.outputs.failed == 'false' && steps.issue_search.outputs.count != '0'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -106,7 +286,7 @@ jobs:
             gh issue close "$ISSUE"
           done
 
-      - name: Send recovery email
+      - name: Send recovery email when recovered naturally
         if: steps.check.outputs.failed == 'false' && steps.issue_search.outputs.count != '0'
         uses: dawidd6/action-send-mail@v3
         with:

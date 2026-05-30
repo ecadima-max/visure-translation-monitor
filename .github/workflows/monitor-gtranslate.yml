@@ -220,30 +220,16 @@ jobs:
               REMOVED_NODES="$REMOVED_NODES, $NODE"
             fi
 
-            FINAL_SUMMARY="${FINAL_SUMMARY}
-
-Attempt #${ATTEMPT}
-Removed node: ${NODE}
-Removed index: ${INDEX}
-Updated server array: ${UPDATED_ARRAY}
-"
+            FINAL_SUMMARY="${FINAL_SUMMARY}\n\nAttempt #${ATTEMPT}\nRemoved node: ${NODE}\nRemoved index: ${INDEX}\nUpdated server array: ${UPDATED_ARRAY}\n"
 
             if [ -z "$FAILED" ]; then
               RECOVERED="true"
               FINAL_DETAILS="Recovered after attempt #${ATTEMPT}. Removed nodes: ${REMOVED_NODES}"
-              FINAL_SUMMARY="${FINAL_SUMMARY}
-
-Result:
-Recovered after attempt #${ATTEMPT}.
-"
+              FINAL_SUMMARY="${FINAL_SUMMARY}\n\nResult:\nRecovered after attempt #${ATTEMPT}.\n"
               break
             else
               FINAL_DETAILS="$FAILED"
-              FINAL_SUMMARY="${FINAL_SUMMARY}
-
-Result:
-Still failing after attempt #${ATTEMPT}.
-"
+              FINAL_SUMMARY="${FINAL_SUMMARY}\n\nResult:\nStill failing after attempt #${ATTEMPT}.\n"
             fi
           done < gtranslate-remediation/attempts.tsv
 
@@ -256,11 +242,7 @@ Still failing after attempt #${ATTEMPT}.
               bye
             "
 
-            FINAL_SUMMARY="${FINAL_SUMMARY}
-
-Final result:
-All 3 attempts failed. Original config.php was restored.
-"
+            FINAL_SUMMARY="${FINAL_SUMMARY}\n\nFinal result:\nAll 3 attempts failed. Original config.php was restored.\n"
           fi
 
           echo "recovered=$RECOVERED" >> "$GITHUB_OUTPUT"
@@ -271,7 +253,7 @@ All 3 attempts failed. Original config.php was restored.
           echo "EOF" >> "$GITHUB_OUTPUT"
 
           echo "summary<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$FINAL_SUMMARY" >> "$GITHUB_OUTPUT"
+          echo -e "$FINAL_SUMMARY" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
           echo "before_config<<EOF" >> "$GITHUB_OUTPUT"

@@ -14,6 +14,9 @@ jobs:
   monitor:
     runs-on: ubuntu-latest
 
+    env:
+      AUTO_FIX_ENABLED: ${{ secrets.AUTO_FIX_ENABLED }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -62,7 +65,7 @@ jobs:
 
       - name: Auto-remediate GTranslate config
         id: remediate
-        if: steps.check.outputs.failed == 'true' && steps.issue_search.outputs.count == '0' && secrets.AUTO_FIX_ENABLED == 'true'
+        if: steps.check.outputs.failed == 'true' && steps.issue_search.outputs.count == '0' && env.AUTO_FIX_ENABLED == 'true'
         shell: bash
         env:
           SFTP_HOST: ${{ secrets.SFTP_HOST }}
@@ -79,7 +82,6 @@ jobs:
 
           mkdir -p gtranslate-remediation
 
-          echo "Downloading current config.php..."
           lftp -u "$SFTP_USER","$SFTP_PASS" sftp://"$SFTP_HOST":"$SFTP_PORT" -e "
             set sftp:auto-confirm yes;
             get $CONFIG_PATH -o gtranslate-remediation/config.before.php;
@@ -91,7 +93,6 @@ jobs:
 
           before_path = "gtranslate-remediation/config.before.php"
           after_path = "gtranslate-remediation/config.after.php"
-          summary_path = "gtranslate-remediation/summary.txt"
 
           domain = os.environ["DOMAIN"].lower().strip()
           domain = re.sub(r"^www\.", "", domain)
@@ -121,7 +122,6 @@ jobs:
               raise SystemExit("Refusing to remove node because server list would become too small")
 
           new_array = "$servers = array(" + ", ".join([repr(s) for s in new_servers]) + ");"
-
           new_content = content[:match.start()] + new_array + content[match.end():]
 
           open(after_path, "w", encoding="utf-8").write(new_content)
@@ -134,8 +134,6 @@ jobs:
               f"Original server array:\n{servers}\n\n"
               f"Updated server array:\n{new_servers}\n"
           )
-          
-          open(summary_path, "w", encoding="utf-8").write(summary)
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
               out.write(f"node={bad_node}\n")
@@ -147,7 +145,6 @@ jobs:
 
           TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
 
-          echo "Uploading backup and modified config.php..."
           lftp -u "$SFTP_USER","$SFTP_PASS" sftp://"$SFTP_HOST":"$SFTP_PORT" -e "
             set sftp:auto-confirm yes;
             put gtranslate-remediation/config.before.php -o ${CONFIG_PATH}.backup-${TIMESTAMP};
@@ -213,12 +210,8 @@ jobs:
             Auto-remediación:
             ${{ steps.remediate.outputs.summary }}
 
-            Resultado del re-check después de modificar config.php:
+            Resultado del re-check:
             recovered=${{ steps.recheck.outputs.recovered }}
-
-            Si recovered=true, el nodo conflictivo fue removido correctamente.
-            Si recovered=false, todavía quedan URLs afectadas:
-            ${{ steps.recheck.outputs.details }}
 
             Config.php ANTES de la modificación:
             ${{ steps.remediate.outputs.before_config }}
@@ -235,11 +228,12 @@ jobs:
 
           ${{ steps.check.outputs.details }}
 
-          Auto-remediation was attempted.
+          Auto-remediation was attempted:
 
           ${{ steps.remediate.outputs.summary }}
 
           Re-check result:
+
           ${{ steps.recheck.outputs.details }}
 
           This issue will remain open until the error disappears."
@@ -264,7 +258,7 @@ jobs:
             Detalles:
             ${{ steps.remediate.outputs.summary }}
 
-            El error "SSL handshake failed" ya no aparece en las páginas traducidas monitoreadas.
+            El error "SSL handshake failed" ya no aparece.
 
       - name: Close issue when recovered naturally
         if: steps.check.outputs.failed == 'false' && steps.issue_search.outputs.count != '0'

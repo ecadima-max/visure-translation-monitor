@@ -38,17 +38,16 @@ jobs:
             BODY=$(curl -L -s --max-time 15 --connect-timeout 8 "$URL" || true)
 
             if echo "$BODY" | grep -qi "SSL handshake failed"; then
-              FAILED="${FAILED}\n- ${URL}: SSL handshake failed"
+              FAILED="${FAILED} ${URL}"
             fi
           done
 
           if [ -n "$FAILED" ]; then
             echo "failed=true" >> "$GITHUB_OUTPUT"
-            echo "details<<EOF" >> "$GITHUB_OUTPUT"
-            echo -e "$FAILED" >> "$GITHUB_OUTPUT"
-            echo "EOF" >> "$GITHUB_OUTPUT"
+            echo "details=SSL handshake failed detected on translated URLs: $FAILED" >> "$GITHUB_OUTPUT"
           else
             echo "failed=false" >> "$GITHUB_OUTPUT"
+            echo "details=No SSL handshake failed error detected." >> "$GITHUB_OUTPUT"
           fi
 
       - name: Check for existing open incident
@@ -63,9 +62,9 @@ jobs:
             --jq 'length')
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
 
-      - name: Auto-remediate GTranslate config with up to 3 attempts
+      - name: Auto-remediate GTranslate config by testing all nodes
         id: remediate
-        if: steps.check.outputs.failed == 'true' && steps.issue_search.outputs.count == '0' && env.AUTO_FIX_ENABLED == 'true'
+        if: steps.check.outputs.failed == 'true' && env.AUTO_FIX_ENABLED == 'true'
         shell: bash
         env:
           SFTP_HOST: ${{ secrets.SFTP_HOST }}
@@ -82,6 +81,7 @@ jobs:
 
           mkdir -p gtranslate-remediation
 
+          echo "Downloading current config.php..."
           lftp -u "$SFTP_USER","$SFTP_PASS" sftp://"$SFTP_HOST":"$SFTP_PORT" -e "
             set sftp:auto-confirm yes;
             get $CONFIG_PATH -o gtranslate-remediation/config.before.php;
@@ -89,7 +89,9 @@ jobs:
           "
 
           python3 << 'PY'
-          import os, re, hashlib
+          import os
+          import re
+          import hashlib
 
           before_path = "gtranslate-remediation/config.before.php"
           domain = os.environ["DOMAIN"].lower().strip()
@@ -107,76 +109,52 @@ jobs:
           servers = re.findall(r"'([^']+)'|\"([^\"]+)\"", array_body)
           servers = [a or b for a, b in servers]
 
-          if not servers:
-              raise SystemExit("Could not parse server list")
+          if len(servers) < 3:
+              raise SystemExit("Refusing remediation because server list is too small")
 
           hash_prefix = hashlib.md5(domain.encode()).hexdigest()[:5]
           calculated_index = int(hash_prefix, 16) % len(servers)
 
-          attempts = []
-          removed_indices = []
+          ordered_indices = list(range(calculated_index, len(servers))) + list(range(0, calculated_index))
 
-          max_attempts = min(3, len(servers) - 2)
+          with open("gtranslate-remediation/attempts.tsv", "w", encoding="utf-8") as attempts_file:
+              for attempt_number, idx in enumerate(ordered_indices, start=1):
+                  node = servers[idx]
+                  new_servers = [server for i, server in enumerate(servers) if i != idx]
 
-          for attempt in range(1, max_attempts + 1):
-              idx = (calculated_index + attempt - 1) % len(servers)
+                  if len(new_servers) < 2:
+                      continue
 
-              if idx in removed_indices:
-                  continue
+                  new_array = "$servers = array(" + ", ".join([repr(s) for s in new_servers]) + ");"
+                  new_content = content[:match.start()] + new_array + content[match.end():]
 
-              removed_indices.append(idx)
+                  attempt_path = f"gtranslate-remediation/config.attempt{attempt_number}.php"
+                  open(attempt_path, "w", encoding="utf-8").write(new_content)
 
-              new_servers = [
-                  server for i, server in enumerate(servers)
-                  if i not in removed_indices
-              ]
+                  updated_array_text = ",".join(new_servers)
 
-              if len(new_servers) < 2:
-                  raise SystemExit("Refusing to remove nodes because server list would become too small")
-
-              new_array = "$servers = array(" + ", ".join([repr(s) for s in new_servers]) + ");"
-              new_content = content[:match.start()] + new_array + content[match.end():]
-
-              attempt_path = f"gtranslate-remediation/config.attempt{attempt}.php"
-              open(attempt_path, "w", encoding="utf-8").write(new_content)
-
-              attempts.append({
-                  "attempt": attempt,
-                  "removed_node": servers[idx],
-                  "removed_index": idx,
-                  "updated_servers": new_servers,
-                  "attempt_path": attempt_path
-              })
-
-          with open("gtranslate-remediation/attempts.tsv", "w", encoding="utf-8") as f:
-              for item in attempts:
-                  f.write(
-                      f"{item['attempt']}\t"
-                      f"{item['removed_node']}\t"
-                      f"{item['removed_index']}\t"
-                      f"{item['attempt_path']}\t"
-                      f"{item['updated_servers']}\n"
+                  attempts_file.write(
+                      f"{attempt_number}\t{node}\t{idx}\t{attempt_path}\t{updated_array_text}\n"
                   )
 
           summary = (
-              "GTranslate auto-remediation prepared.\n\n"
-              f"Domain:\n{domain}\n\n"
-              f"Calculated starting server index:\n{calculated_index}\n\n"
-              f"Original server array:\n{servers}\n\n"
-              "Remediation strategy:\n"
-              "Attempt #1 removes the calculated node.\n"
-              "Attempt #2 additionally removes the next node if still failing.\n"
-              "Attempt #3 additionally removes the next node if still failing.\n"
+              f"Domain={domain}; "
+              f"OriginalNodes={','.join(servers)}; "
+              f"CalculatedStartIndex={calculated_index}; "
+              f"Strategy=Test every node one by one. Remove one node, upload config, re-check URLs. "
+              f"If recovered, keep that config. If all attempts fail, restore original config."
           )
 
           open("gtranslate-remediation/summary.txt", "w", encoding="utf-8").write(summary)
           PY
 
           TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
+          BACKUP_REMOTE_PATH="${CONFIG_PATH}.backup-${TIMESTAMP}"
 
+          echo "Creating remote backup: $BACKUP_REMOTE_PATH"
           lftp -u "$SFTP_USER","$SFTP_PASS" sftp://"$SFTP_HOST":"$SFTP_PORT" -e "
             set sftp:auto-confirm yes;
-            put gtranslate-remediation/config.before.php -o ${CONFIG_PATH}.backup-${TIMESTAMP};
+            put gtranslate-remediation/config.before.php -o $BACKUP_REMOTE_PATH;
             bye
           "
 
@@ -188,12 +166,17 @@ jobs:
           )
 
           RECOVERED="false"
-          FINAL_DETAILS=""
-          REMOVED_NODES=""
-          FINAL_SUMMARY="$(cat gtranslate-remediation/summary.txt)"
+          REMOVED_NODE=""
+          REMOVED_INDEX=""
+          ATTEMPTS_DONE="0"
+          ATTEMPT_LOG=""
+          FINAL_DETAILS="Auto-remediation started."
+          BASE_SUMMARY="$(cat gtranslate-remediation/summary.txt)"
 
           while IFS=$'\t' read -r ATTEMPT NODE INDEX ATTEMPT_PATH UPDATED_ARRAY; do
-            echo "Attempt $ATTEMPT: removing node $NODE at index $INDEX"
+            ATTEMPTS_DONE="$ATTEMPT"
+
+            echo "Attempt $ATTEMPT: removing node '$NODE' at index $INDEX"
 
             lftp -u "$SFTP_USER","$SFTP_PASS" sftp://"$SFTP_HOST":"$SFTP_PORT" -e "
               set sftp:auto-confirm yes;
@@ -210,31 +193,30 @@ jobs:
               BODY=$(curl -L -s --max-time 15 --connect-timeout 8 "$URL" || true)
 
               if echo "$BODY" | grep -qi "SSL handshake failed"; then
-                FAILED="${FAILED}\n- ${URL}: SSL handshake failed"
+                FAILED="${FAILED} ${URL}"
               fi
             done
 
-            if [ -z "$REMOVED_NODES" ]; then
-              REMOVED_NODES="$NODE"
+            if [ -z "$ATTEMPT_LOG" ]; then
+              ATTEMPT_LOG="Attempt ${ATTEMPT}: removed ${NODE} at index ${INDEX}"
             else
-              REMOVED_NODES="$REMOVED_NODES, $NODE"
+              ATTEMPT_LOG="${ATTEMPT_LOG} | Attempt ${ATTEMPT}: removed ${NODE} at index ${INDEX}"
             fi
-
-            FINAL_SUMMARY="${FINAL_SUMMARY}\n\nAttempt #${ATTEMPT}\nRemoved node: ${NODE}\nRemoved index: ${INDEX}\nUpdated server array: ${UPDATED_ARRAY}\n"
 
             if [ -z "$FAILED" ]; then
               RECOVERED="true"
-              FINAL_DETAILS="Recovered after attempt #${ATTEMPT}. Removed nodes: ${REMOVED_NODES}"
-              FINAL_SUMMARY="${FINAL_SUMMARY}\n\nResult:\nRecovered after attempt #${ATTEMPT}.\n"
+              REMOVED_NODE="$NODE"
+              REMOVED_INDEX="$INDEX"
+              FINAL_DETAILS="Recovered after attempt ${ATTEMPT}. Removed node ${NODE} at index ${INDEX}. Backup created at ${BACKUP_REMOTE_PATH}."
+              echo "$FINAL_DETAILS"
               break
             else
-              FINAL_DETAILS="$FAILED"
-              FINAL_SUMMARY="${FINAL_SUMMARY}\n\nResult:\nStill failing after attempt #${ATTEMPT}.\n"
+              echo "Still failing after attempt $ATTEMPT"
             fi
           done < gtranslate-remediation/attempts.tsv
 
           if [ "$RECOVERED" != "true" ]; then
-            echo "All remediation attempts failed. Restoring original config.php."
+            echo "All node-removal attempts failed. Restoring original config.php."
 
             lftp -u "$SFTP_USER","$SFTP_PASS" sftp://"$SFTP_HOST":"$SFTP_PORT" -e "
               set sftp:auto-confirm yes;
@@ -242,23 +224,18 @@ jobs:
               bye
             "
 
-            FINAL_SUMMARY="${FINAL_SUMMARY}\n\nFinal result:\nAll 3 attempts failed. Original config.php was restored.\n"
+            FINAL_DETAILS="All node-removal attempts failed. Original config.php was restored. Backup created at ${BACKUP_REMOTE_PATH}."
           fi
 
-          echo "recovered=$RECOVERED" >> "$GITHUB_OUTPUT"
-          echo "removed_nodes=$REMOVED_NODES" >> "$GITHUB_OUTPUT"
+          SUMMARY="${BASE_SUMMARY}; Backup=${BACKUP_REMOTE_PATH}; AttemptsDone=${ATTEMPTS_DONE}; Recovered=${RECOVERED}; RemovedNode=${REMOVED_NODE}; RemovedIndex=${REMOVED_INDEX}; AttemptLog=${ATTEMPT_LOG}; FinalDetails=${FINAL_DETAILS}"
 
-          echo "details<<EOF" >> "$GITHUB_OUTPUT"
-          echo -e "$FINAL_DETAILS" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
-          echo "summary<<EOF" >> "$GITHUB_OUTPUT"
-          echo -e "$FINAL_SUMMARY" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
-          echo "before_config<<EOF" >> "$GITHUB_OUTPUT"
-          cat gtranslate-remediation/config.before.php >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "recovered=${RECOVERED}" >> "$GITHUB_OUTPUT"
+          echo "removed_node=${REMOVED_NODE}" >> "$GITHUB_OUTPUT"
+          echo "removed_index=${REMOVED_INDEX}" >> "$GITHUB_OUTPUT"
+          echo "attempts_done=${ATTEMPTS_DONE}" >> "$GITHUB_OUTPUT"
+          echo "backup_path=${BACKUP_REMOTE_PATH}" >> "$GITHUB_OUTPUT"
+          echo "summary=${SUMMARY}" >> "$GITHUB_OUTPUT"
+          echo "details=${FINAL_DETAILS}" >> "$GITHUB_OUTPUT"
 
       - name: Send alert and remediation email
         if: steps.check.outputs.failed == 'true' && steps.issue_search.outputs.count == '0'
@@ -277,20 +254,17 @@ jobs:
             URLs afectadas:
             ${{ steps.check.outputs.details }}
 
-            Auto-remediación:
-            ${{ steps.remediate.outputs.summary }}
-
-            Resultado:
-            recovered=${{ steps.remediate.outputs.recovered }}
-
-            Nodos removidos:
-            ${{ steps.remediate.outputs.removed_nodes }}
-
-            Detalles:
+            Resultado de auto-remediación:
             ${{ steps.remediate.outputs.details }}
 
-            Config.php ANTES de la modificación:
-            ${{ steps.remediate.outputs.before_config }}
+            Resumen:
+            ${{ steps.remediate.outputs.summary }}
+
+            Backup remoto creado:
+            ${{ steps.remediate.outputs.backup_path }}
+
+            Nota:
+            El workflow ya no envía el contenido completo de config.php por seguridad.
 
       - name: Create GitHub issue when incident starts and still failing
         if: steps.check.outputs.failed == 'true' && steps.issue_search.outputs.count == '0' && steps.remediate.outputs.recovered != 'true'
@@ -300,17 +274,19 @@ jobs:
           gh issue create \
             --title "GTranslate SSL handshake failed detected" \
             --label "gtranslate-monitor" \
-            --body "Automatic monitor detected SSL handshake failed in translated pages:
+            --body "Automatic monitor detected SSL handshake failed in translated pages.
 
+          URLs:
           ${{ steps.check.outputs.details }}
 
-          Auto-remediation was attempted:
+          Auto-remediation result:
+          ${{ steps.remediate.outputs.details }}
 
+          Summary:
           ${{ steps.remediate.outputs.summary }}
 
-          Re-check result:
-
-          ${{ steps.remediate.outputs.details }}
+          Backup:
+          ${{ steps.remediate.outputs.backup_path }}
 
           This issue will remain open until the error disappears."
 
@@ -328,13 +304,22 @@ jobs:
           body: |
             El monitor detectó recuperación después de auto-remediación.
 
-            Nodos removidos:
-            ${{ steps.remediate.outputs.removed_nodes }}
+            Nodo removido:
+            ${{ steps.remediate.outputs.removed_node }}
+
+            Índice removido:
+            ${{ steps.remediate.outputs.removed_index }}
+
+            Intentos realizados:
+            ${{ steps.remediate.outputs.attempts_done }}
+
+            Backup remoto:
+            ${{ steps.remediate.outputs.backup_path }}
 
             Detalles:
-            ${{ steps.remediate.outputs.summary }}
+            ${{ steps.remediate.outputs.details }}
 
-            El error "SSL handshake failed" ya no aparece.
+            El error "SSL handshake failed" ya no aparece en las páginas traducidas monitoreadas.
 
       - name: Close issue when recovered naturally
         if: steps.check.outputs.failed == 'false' && steps.issue_search.outputs.count != '0'
